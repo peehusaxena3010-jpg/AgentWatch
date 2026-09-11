@@ -1,0 +1,19 @@
+{
+  "min_raw_score": -0.07676651933971257,
+  "max_raw_score": 0.15897888764642992,
+  "n_samples": 52,
+  "features": [
+    "num_steps",
+    "total_latency_ms",
+    "avg_step_latency_ms",
+    "max_step_latency_ms",
+    "num_tool_calls",
+    "num_distinct_tools",
+    "repeated_consecutive_calls",
+    "num_failed_steps",
+    "num_error_results",
+    "is_error_status",
+    "is_incomplete_status",
+    "final_response_len"
+  ]
+}

@@ -1,29 +1,37 @@
 """
-Batch trace generator (v2) — larger, randomized scenario pool.
+Batch trace generator — larger, randomized scenario pool.
 
-Each run randomly samples N scenarios (with repetition allowed across runs,
-and slight input phrasing variation), so running this multiple times keeps
-adding genuinely varied traces instead of repeating the same 8 every time.
+Generates realistic agent traces across customer support scenarios:
+- Valid refunds for delayed delivery (Order #4521)
+- Standard order delivery inquiries (Order #1001)
+- In-flight order processing queries (Order #2002)
+- Double refund attempts / Policy violations (Order #3003)
+- Non-existent orders / Wrong tool calls (Order #9999)
+- Repeated tool calls / Infinite loop triggers (Loop scenario)
+- Ambiguous queries triggering human escalation
 
-IMPORTANT: start the API server first in another terminal:
-    uvicorn backend.main:app --reload
-Then run this script:
-    python scripts/generate_dataset.py
+Stores via API if running, or directly to SQLite database.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import random
 import sys
 import time
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
-from agents.support_agent import run_agent, send_trace_to_api  # noqa: E402
+import requests
+from agents.support_agent import run_agent, API_BASE_URL
+from backend.database import SessionLocal, TraceRecord, init_db
 
-# A pool of (label, template) scenarios. Templates get lightly varied so
-# repeated runs don't produce byte-identical user_input strings either.
 SCENARIO_POOL = [
     ("normal_refund_valid", [
         "I want a refund for order #4521, it never arrived.",
@@ -60,37 +68,74 @@ SCENARIO_POOL = [
     ]),
 ]
 
-SAMPLE_SIZE = 12  # traces generated per run
+SAMPLE_SIZE = 25
 
 
-def main():
-    random.seed()  # true randomness each run, not reproducible on purpose
+def check_api_alive() -> bool:
+    try:
+        r = requests.get(f"{API_BASE_URL}/health", timeout=0.5)
+        return r.status_code == 200
+    except Exception:
+        return False
 
-    sampled = []
-    for _ in range(SAMPLE_SIZE):
-        label, templates = random.choice(SCENARIO_POOL)
-        user_input = random.choice(templates)
-        sampled.append((label, user_input))
 
-    print(f"Running {SAMPLE_SIZE} randomly sampled scenarios...\n")
+def main(sample_size: int = SAMPLE_SIZE):
+    init_db()
+    random.seed()
+
+    api_active = check_api_alive()
+    mode_str = f"REST API ({API_BASE_URL})" if api_active else "Direct SQLite Storage"
+    print(f"Target Storage: {mode_str}")
+    print(f"Generating and executing {sample_size} varied support scenarios...\n")
+
     stored_count = 0
+    db = SessionLocal() if not api_active else None
 
-    for label, user_input in sampled:
-        print(f"--- [{label}] \"{user_input}\" ---")
-        trace = run_agent(user_input)
-        print(f"    status={trace.status}, steps={len(trace.steps)}, latency_ms={trace.total_latency_ms}")
+    try:
+        for i in range(1, sample_size + 1):
+            label, templates = random.choice(SCENARIO_POOL)
+            user_input = random.choice(templates)
+            print(f"[{i:02d}/{sample_size}] [{label}] \"{user_input}\"")
+            trace = run_agent(user_input)
 
-        success = send_trace_to_api(trace)
-        if success:
-            stored_count += 1
+            if api_active:
+                try:
+                    res = requests.post(
+                        f"{API_BASE_URL}/traces",
+                        data=trace.model_dump_json(),
+                        headers={"Content-Type": "application/json"},
+                        timeout=2,
+                    )
+                    success = res.status_code in (200, 201)
+                except Exception:
+                    success = False
+            else:
+                record = TraceRecord(
+                    trace_id=str(trace.trace_id),
+                    session_id=str(trace.session_id),
+                    agent_name=trace.agent_name,
+                    agent_version=trace.agent_version,
+                    timestamp=trace.timestamp,
+                    status=trace.status,
+                    anomaly_score=trace.anomaly_score,
+                    faithfulness_score=trace.faithfulness_score,
+                    total_latency_ms=trace.total_latency_ms,
+                    full_trace_json=trace.model_dump_json(),
+                )
+                db.add(record)
+                db.commit()
+                success = True
 
-        print()
-        time.sleep(0.3)
+            if success:
+                stored_count += 1
+            print(f"       -> status={trace.status}, steps={len(trace.steps)}, latency={trace.total_latency_ms}ms (saved: {success})")
 
-    print(f"✅ Done. {stored_count}/{SAMPLE_SIZE} traces stored successfully.")
-    print("   Go to http://127.0.0.1:8000/docs -> GET /traces to view them.")
-    print("   Run this script again for another batch of randomized scenarios.")
+        print(f"\n✅ Done. {stored_count}/{sample_size} traces generated and stored successfully.")
+    finally:
+        if db is not None:
+            db.close()
 
 
 if __name__ == "__main__":
-    main()
+    count = int(sys.argv[1]) if len(sys.argv) > 1 else SAMPLE_SIZE
+    main(count)

@@ -1,0 +1,10 @@
+{
+  "threshold": 0.8501067278523656,
+  "metadata": {
+    "reviewed_traces_used": 9,
+    "old_threshold": 0.6,
+    "old_false_positive_rate": 1.0,
+    "new_false_positive_rate": 0.0,
+    "youdens_j": 0.5
+  }
+}

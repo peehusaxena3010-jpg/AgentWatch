@@ -12,10 +12,6 @@ model's threshold, but the model itself doesn't require them to train.
 
 Run with:
     python ml/train_anomaly_model.py
-
-Requires the API server NOT to be running exclusively -- this script talks
-directly to the SQLite database, not through the API, so it's safe to run
-even while uvicorn is up.
 """
 
 from __future__ import annotations
@@ -26,6 +22,11 @@ import os
 import sys
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 import joblib
 import pandas as pd
@@ -35,6 +36,7 @@ from backend.database import SessionLocal, TraceRecord
 from ml.feature_extraction import trace_to_features, FEATURE_NAMES
 
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "anomaly_model.joblib")
+META_PATH = os.path.join(os.path.dirname(__file__), "models", "model_metadata.json")
 
 
 def load_traces_as_dataframe() -> tuple[pd.DataFrame, list[str]]:
@@ -54,31 +56,22 @@ def load_traces_as_dataframe() -> tuple[pd.DataFrame, list[str]]:
         db.close()
 
 
-def train_and_score() -> None:
+def train_and_score() -> dict[str, Any]:
     df, trace_ids = load_traces_as_dataframe()
 
     if len(df) < 5:
-        print(f"⚠️  Only {len(df)} traces found. Isolation Forest needs more data to be "
-              f"meaningful (aim for 20+). Generate more traces first via generate_dataset.py.")
+        msg = f"Only {len(df)} traces found. Isolation Forest needs at least 5 traces (aim for 20+)."
+        print(f"⚠️  {msg}")
         if len(df) == 0:
-            return
+            return {"status": "error", "message": msg, "count": 0, "flagged": 0}
 
     print(f"Training on {len(df)} traces with {len(FEATURE_NAMES)} features...")
 
-    # Log-transform latency features. Without this, a handful of extreme
-    # outliers (e.g. a 170-second API rate-limit stall vs. a normal 50-300ms
-    # run -- a ~1000x spread) dominate the split points Isolation Forest
-    # chooses, distorting how ALL other points get scored. log1p compresses
-    # the extreme values while preserving relative ordering, so genuine
-    # latency anomalies are still detected without swamping the model.
+    # Log-transform latency features to prevent extreme latency spikes from dominating
     df_transformed = df.copy()
     for col in ["total_latency_ms", "avg_step_latency_ms", "max_step_latency_ms"]:
         df_transformed[col] = df_transformed[col].apply(math.log1p)
 
-    # A fixed contamination estimate is more stable than "auto" on small /
-    # mixed-quality datasets, where "auto" can flag an unrealistically large
-    # fraction of points. 0.15 is a reasonable starting assumption -- revisit
-    # once you have real labeled data from the human feedback loop (Phase 4).
     model = IsolationForest(
         n_estimators=100,
         contamination=0.15,
@@ -86,24 +79,30 @@ def train_and_score() -> None:
     )
     model.fit(df_transformed)
 
-    # decision_function: higher = more normal, lower/negative = more anomalous.
-    # We flip and rescale to a 0-1 "anomaly_score" where 1 = most anomalous,
-    # which is more intuitive to read on a dashboard than a raw signed score.
     raw_scores = model.decision_function(df_transformed)
-    anomaly_scores = 1 - (raw_scores - raw_scores.min()) / (raw_scores.max() - raw_scores.min() + 1e-9)
+    min_score, max_score = float(raw_scores.min()), float(raw_scores.max())
+    denominator = (max_score - min_score) if (max_score - min_score) > 1e-9 else 1.0
+    anomaly_scores = 1 - (raw_scores - min_score) / denominator
 
     predictions = model.predict(df_transformed)  # -1 = anomaly, 1 = normal
 
-    # Save the trained model for reuse (e.g. scoring new traces later without
-    # retraining from scratch).
+    # Save model and normalization metadata
     os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
     joblib.dump(model, MODEL_PATH)
+    metadata = {
+        "min_raw_score": min_score,
+        "max_raw_score": max_score,
+        "n_samples": len(df),
+        "features": FEATURE_NAMES,
+    }
+    with open(META_PATH, "w") as f:
+        json.dump(metadata, f, indent=2)
     print(f"Model saved to {MODEL_PATH}")
 
-    # Write scores back into the database.
+    # Write scores back into database
     db = SessionLocal()
+    flagged_count = 0
     try:
-        flagged_count = 0
         for trace_id, score, pred in zip(trace_ids, anomaly_scores, predictions):
             record = db.get(TraceRecord, trace_id)
             if record is None:
@@ -122,17 +121,49 @@ def train_and_score() -> None:
 
     print(f"✅ Scored {len(trace_ids)} traces. {flagged_count} flagged as anomalous by Isolation Forest.")
 
-    # Print a quick summary table for sanity-checking.
-    df_summary = df.copy()
-    df_summary["anomaly_score"] = anomaly_scores
-    df_summary["flagged"] = predictions == -1
-    df_summary["trace_id"] = trace_ids
-    print("\nTop 5 most anomalous traces:")
-    print(
-        df_summary.sort_values("anomaly_score", ascending=False)
-        .head(5)[["trace_id", "anomaly_score", "flagged", "num_steps", "is_error_status", "max_step_latency_ms"]]
-        .to_string(index=False)
-    )
+    return {
+        "status": "success",
+        "total_scored": len(trace_ids),
+        "flagged_count": flagged_count,
+        "model_path": MODEL_PATH,
+    }
+
+
+def predict_single_trace(trace: dict[str, Any]) -> float:
+    """
+    Infers the anomaly score for a single trace dict in real-time.
+    Falls back to feature heuristic if model is not yet saved.
+    """
+    feats = trace_to_features(trace)
+
+    if os.path.exists(MODEL_PATH) and os.path.exists(META_PATH):
+        try:
+            model = joblib.load(MODEL_PATH)
+            with open(META_PATH, "r") as f:
+                meta = json.load(f)
+            df = pd.DataFrame([feats], columns=FEATURE_NAMES)
+            for col in ["total_latency_ms", "avg_step_latency_ms", "max_step_latency_ms"]:
+                df[col] = df[col].apply(math.log1p)
+
+            raw = float(model.decision_function(df)[0])
+            min_s, max_s = meta["min_raw_score"], meta["max_raw_score"]
+            denom = (max_s - min_s) if (max_s - min_s) > 1e-9 else 1.0
+            score = 1.0 - (raw - min_s) / denom
+            return max(0.0, min(1.0, round(score, 3)))
+        except Exception:
+            pass
+
+    # Heuristic fallback if model not fitted yet
+    penalty = 0.0
+    if feats.get("is_error_status"):
+        penalty += 0.35
+    if feats.get("repeated_consecutive_calls", 0) > 0:
+        penalty += 0.4
+    if feats.get("num_failed_steps", 0) > 0:
+        penalty += 0.25
+    if feats.get("total_latency_ms", 0) > 10000:
+        penalty += 0.2
+    return max(0.0, min(1.0, round(penalty, 3)))
 
 
 if __name__ == "__main__":

@@ -21,13 +21,18 @@ import sys
 import time
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 from backend.database import SessionLocal, TraceRecord  # noqa: E402
-from auditor.auditor import classify_trace  # noqa: E402
+from auditor.auditor import classify_trace, MOCK_MODE  # noqa: E402
 from ml.threshold_config import load_threshold  # noqa: E402
 
-FLAG_THRESHOLD = load_threshold()  # now reads from ml/threshold_config.json, updated by the feedback loop
-DELAY_BETWEEN_CALLS_SECONDS = 4  # be gentle on free-tier rate limits (real mode only)
+FLAG_THRESHOLD = load_threshold()
+DELAY_BETWEEN_CALLS_SECONDS = 0.05 if MOCK_MODE else 4
 
 
 def run_audit() -> None:

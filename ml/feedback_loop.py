@@ -26,6 +26,11 @@ import os
 import sys
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 from backend.database import SessionLocal, TraceRecord
 from ml.threshold_config import load_threshold, save_threshold

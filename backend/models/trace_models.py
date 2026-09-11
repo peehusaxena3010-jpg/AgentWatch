@@ -1,5 +1,5 @@
 from __future__ import annotations
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Optional
 from uuid import UUID, uuid4
@@ -39,7 +39,7 @@ class AgentTrace(BaseModel):
     session_id: UUID = Field(default_factory=uuid4)
     agent_name: str
     agent_version: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     user_input: str
     steps: list[Step]
     final_response: str

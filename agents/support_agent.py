@@ -1,44 +1,50 @@
 """
-Support agent: hand-rolled tool-calling loop using Gemini 2.5 Flash.
+Support agent: tool-calling loop using Gemini 2.5 Flash or scenario-aware mock.
 
 Every reasoning step, tool call, and result is logged into the AgentTrace
 schema (backend/models/trace_models.py) as it happens.
 
 MOCK_MODE:
-    True  -> no API calls made. Scenario-aware scripted responses are used
-             instead, so you can generate a varied labeled dataset quickly
-             and for free, without needing network access or burning your
-             Gemini quota.
-    False -> real calls to Gemini 2.5 Flash via the google-genai SDK.
-             Requires GEMINI_API_KEY set in your .env file (loaded via
-             python-dotenv).
-
-Run this file directly to execute one agent turn, print the resulting
-trace as JSON, and send it to the ingestion API.
+    True  -> no API calls made. Realistic scenario-aware responses are generated.
+    False -> real calls to Gemini 2.5 Flash via google-genai SDK.
+             Requires GEMINI_API_KEY in .env.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import random
 import sys
 import time
 from uuid import uuid4
+from typing import Optional
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-from backend.models.trace_models import AgentTrace, Step, StepStatus, TraceStatus  # noqa: E402
-from agents.tools import TOOL_REGISTRY, TOOL_DECLARATIONS  # noqa: E402
+from backend.models.trace_models import (
+    AgentTrace,
+    Step,
+    StepStatus,
+    TraceStatus,
+    AuditorClassification,
+)
+from agents.tools import TOOL_REGISTRY, TOOL_DECLARATIONS
 
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass  # python-dotenv not installed yet — fine in MOCK_MODE
+    pass
 
-MOCK_MODE = True  # flip to False once you've added your real GEMINI_API_KEY
+_API_KEY = os.environ.get("GEMINI_API_KEY")
+_EXPLICIT_MOCK = os.environ.get("MOCK_MODE")
+if _EXPLICIT_MOCK is not None:
+    MOCK_MODE = _EXPLICIT_MOCK.lower() in ("true", "1", "yes")
+else:
+    MOCK_MODE = not bool(_API_KEY and _API_KEY.strip() and _API_KEY != "your_key_here")
+
 MAX_STEPS = 6
-
 AGENT_NAME = "support_agent"
 AGENT_VERSION = "v1"
 
@@ -51,15 +57,13 @@ before calling a tool."""
 
 
 # --------------------------------------------------------------------------
-# MOCK PATH — scenario-aware scripted responses, no real Content/Part objects needed.
+# MOCK PATH — scenario-aware scripted responses
 # --------------------------------------------------------------------------
 
 def scripted_plan(user_input: str):
     """
     Returns a list of (tool_name, tool_args, reasoning) steps based on what
-    the input actually contains, so mock-mode runs produce realistic,
-    varied traces instead of one repeated pattern -- needed for a usable
-    anomaly-detection training set.
+    the input actually contains.
     """
     ui = user_input.lower()
 
@@ -90,7 +94,7 @@ def scripted_plan(user_input: str):
             ("check_order_status", {"order_id": "4521"}, "Checking order status."),
             ("check_order_status", {"order_id": "4521"}, "Checking again to be sure."),
             ("check_order_status", {"order_id": "4521"}, "Checking once more."),
-        ]  # repeated identical tool call -> loop signal for anomaly detection
+        ]  # repeated identical tool call -> loop signal
     # ambiguous / no order ID given
     return [
         ("escalate_to_human", {"order_id": "0000", "issue_summary": "Ambiguous request, no order ID provided."}, "Request is ambiguous, escalating to a human."),
@@ -104,14 +108,12 @@ def run_agent_mock(user_input: str) -> tuple[list[Step], str, TraceStatus, str |
     error_message = None
 
     plan = scripted_plan(user_input)
-    # ~15% chance of an artificial latency spike on the first step, so the
-    # dataset contains realistic latency-anomaly examples too.
     inject_latency_spike = random.random() < 0.15
 
     for i, (tool_name, tool_args, reasoning) in enumerate(plan, start=1):
         step_start = time.perf_counter()
         if inject_latency_spike and i == 1:
-            time.sleep(0.3)
+            time.sleep(0.2)
 
         tool_fn = TOOL_REGISTRY.get(tool_name)
         tool_result = tool_fn(**tool_args) if tool_fn else {"error": f"Unknown tool '{tool_name}'"}
@@ -120,7 +122,9 @@ def run_agent_mock(user_input: str) -> tuple[list[Step], str, TraceStatus, str |
         steps.append(Step(
             step_number=i,
             decision_rationale=reasoning,
-            tool_called=tool_name, tool_args=tool_args, tool_result=tool_result,
+            tool_called=tool_name,
+            tool_args=tool_args,
+            tool_result=tool_result,
             step_status=step_status,
             latency_ms=round((time.perf_counter() - step_start) * 1000, 2),
         ))
@@ -130,31 +134,42 @@ def run_agent_mock(user_input: str) -> tuple[list[Step], str, TraceStatus, str |
             final_response = f"Something went wrong: {tool_result.get('error')}"
             break
     else:
-        final_response = "Your request has been handled successfully."
+        # Build contextual response
+        ui = user_input.lower()
+        if "4521" in ui:
+            final_response = "I have verified that order #4521 was overdue and issued a full refund of $49.99 to your account."
+        elif "1001" in ui:
+            final_response = "Order #1001 was successfully delivered on 2026-07-15. Amount was $19.99."
+        elif "2002" in ui:
+            final_response = "Order #2002 is currently processing with an estimated delivery date of 2026-07-25."
+        elif "loop" in ui:
+            final_response = "I verified order #4521 multiple times. Status is shipped."
+        else:
+            final_response = "Your request has been escalated to our human support team with a ticket created."
         status = TraceStatus.success
 
     return steps, final_response, status, error_message
 
 
 # --------------------------------------------------------------------------
-# REAL PATH — proper Gemini types.Content / types.Part multi-turn handling.
+# REAL PATH — Gemini 2.5 Flash multi-turn tool calling
 # --------------------------------------------------------------------------
 
 def run_agent_real(user_input: str) -> tuple[list[Step], str, TraceStatus, str | None]:
-    from google import genai
-    from google.genai import types
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError:
+        return run_agent_mock(user_input)
 
     api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        return [], "", TraceStatus.error, "GEMINI_API_KEY not set. Add it to your .env file."
+    if not api_key or api_key == "your_key_here":
+        return run_agent_mock(user_input)
 
-    # 30-second timeout on the HTTP call itself, so a stalled/rate-limited
-    # request fails loudly instead of hanging forever with no error.
     client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=30_000))
     tools = [types.Tool(function_declarations=TOOL_DECLARATIONS)]
     config = types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, tools=tools)
 
-    # Real Gemini conversation history — a list of types.Content objects.
     contents: list = [
         types.Content(role="user", parts=[types.Part.from_text(text=user_input)])
     ]
@@ -166,22 +181,18 @@ def run_agent_real(user_input: str) -> tuple[list[Step], str, TraceStatus, str |
 
     for step_number in range(1, MAX_STEPS + 1):
         step_start = time.perf_counter()
-        print(f"[step {step_number}] calling Gemini API...", flush=True)
         try:
             response = client.models.generate_content(
                 model="gemini-2.5-flash", contents=contents, config=config,
             )
-        except Exception as exc:  # noqa: BLE001
-            print(f"[step {step_number}] API call failed: {exc}", flush=True)
+        except Exception as exc:
             error_message = str(exc)
             status = TraceStatus.error
             break
-        print(f"[step {step_number}] API call returned in {round((time.perf_counter() - step_start) * 1000, 1)}ms", flush=True)
 
         candidate = response.candidates[0]
-        contents.append(candidate.content)  # keep model's turn in history
+        contents.append(candidate.content)
 
-        # A turn can contain a text part (reasoning) and/or a function_call part.
         reasoning_text = ""
         function_call = None
         for part in candidate.content.parts:
@@ -191,7 +202,6 @@ def run_agent_real(user_input: str) -> tuple[list[Step], str, TraceStatus, str |
                 function_call = part.function_call
 
         if function_call is None:
-            # No tool call -> this is the agent's final answer.
             final_response = reasoning_text or "(model returned an empty response)"
             steps.append(Step(
                 step_number=step_number,
@@ -203,7 +213,6 @@ def run_agent_real(user_input: str) -> tuple[list[Step], str, TraceStatus, str |
             status = TraceStatus.success
             break
 
-        # Execute the requested tool.
         tool_name = function_call.name
         tool_args = dict(function_call.args)
         tool_fn = TOOL_REGISTRY.get(tool_name)
@@ -215,7 +224,7 @@ def run_agent_real(user_input: str) -> tuple[list[Step], str, TraceStatus, str |
             try:
                 tool_result = tool_fn(**tool_args)
                 step_status = StepStatus.failure if "error" in tool_result else StepStatus.success
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 tool_result = {"error": str(exc)}
                 step_status = StepStatus.failure
 
@@ -227,7 +236,6 @@ def run_agent_real(user_input: str) -> tuple[list[Step], str, TraceStatus, str |
             latency_ms=round((time.perf_counter() - step_start) * 1000, 2),
         ))
 
-        # Feed the function's result back to the model as the next turn.
         function_response_part = types.Part.from_function_response(
             name=tool_name, response=tool_result,
         )
@@ -238,10 +246,6 @@ def run_agent_real(user_input: str) -> tuple[list[Step], str, TraceStatus, str |
 
     return steps, final_response, status, error_message
 
-
-# --------------------------------------------------------------------------
-# Shared entry point
-# --------------------------------------------------------------------------
 
 def run_agent(user_input: str) -> AgentTrace:
     """Runs the tool-calling loop end-to-end and returns a populated AgentTrace."""
@@ -267,17 +271,79 @@ def run_agent(user_input: str) -> AgentTrace:
     )
 
 
+def execute_and_observe(user_input: str, auto_score: bool = True, persist: bool = True) -> AgentTrace:
+    """
+    Executes the agent and immediately passes the trace through the full
+    observability pipeline: Anomaly Detection, Faithfulness Scoring, and
+    Auditor Classification (if flagged).
+    """
+    trace = run_agent(user_input)
+    trace_dict = trace.model_dump()
+
+    # 1. Anomaly Scoring
+    if auto_score:
+        try:
+            from ml.train_anomaly_model import predict_single_trace
+            trace.anomaly_score = predict_single_trace(trace_dict)
+        except Exception:
+            pass
+
+        # 2. Faithfulness Scoring
+        try:
+            from ml.faithfulness_scorer import score_trace
+            f_score, _ = score_trace(trace_dict)
+            trace.faithfulness_score = f_score
+        except Exception:
+            pass
+
+        # 3. Auditor if flagged
+        try:
+            from ml.threshold_config import load_threshold
+            from auditor.auditor import classify_trace
+            threshold = load_threshold()
+            if trace.anomaly_score is not None and trace.anomaly_score >= threshold:
+                audit_res = classify_trace(trace.model_dump())
+                trace.auditor_classification = AuditorClassification(
+                    failure_mode=audit_res.get("failure_mode"),
+                    explanation=audit_res.get("explanation"),
+                )
+        except Exception:
+            pass
+
+    # 4. Storage to DB
+    if persist:
+        try:
+            from backend.database import SessionLocal, TraceRecord
+            db = SessionLocal()
+            try:
+                record = TraceRecord(
+                    trace_id=str(trace.trace_id),
+                    session_id=str(trace.session_id),
+                    agent_name=trace.agent_name,
+                    agent_version=trace.agent_version,
+                    timestamp=trace.timestamp,
+                    status=trace.status,
+                    anomaly_score=trace.anomaly_score,
+                    faithfulness_score=trace.faithfulness_score,
+                    total_latency_ms=trace.total_latency_ms,
+                    full_trace_json=trace.model_dump_json(),
+                )
+                db.add(record)
+                db.commit()
+            finally:
+                db.close()
+        except Exception as exc:
+            print(f"[storage warning] Could not persist trace to DB: {exc}")
+
+    return trace
+
+
 API_BASE_URL = os.environ.get("AGENTWATCH_API_URL", "http://127.0.0.1:8000")
 
 
 def send_trace_to_api(trace: AgentTrace) -> bool:
-    """
-    POSTs a trace to the ingestion API. Returns True on success, False on
-    failure (e.g. server not running) — never raises, so a dead API server
-    doesn't crash agent runs; it just skips storage with a warning.
-    """
+    """POSTs a trace to the ingestion API."""
     import requests
-
     try:
         response = requests.post(
             f"{API_BASE_URL}/traces",
@@ -285,19 +351,11 @@ def send_trace_to_api(trace: AgentTrace) -> bool:
             headers={"Content-Type": "application/json"},
             timeout=5,
         )
-        if response.status_code == 201:
-            print(f"[stored] trace {trace.trace_id} saved to API.")
-            return True
-        else:
-            print(f"[warning] API returned {response.status_code}: {response.text}")
-            return False
-    except Exception as exc:  # noqa: BLE001
-        print(f"[warning] Could not reach API at {API_BASE_URL}: {exc}")
+        return response.status_code in (200, 201)
+    except Exception:
         return False
 
 
 if __name__ == "__main__":
-    trace = run_agent("I want a refund for order #4521, it never arrived.")
-    print(trace.model_dump_json(indent=2))
-    print(f"\n✅ Agent run complete. Status: {trace.status}, steps: {len(trace.steps)}, total_latency_ms: {trace.total_latency_ms}")
-    send_trace_to_api(trace)
+    t = execute_and_observe("I want a refund for order #4521, it never arrived.")
+    print(t.model_dump_json(indent=2))
