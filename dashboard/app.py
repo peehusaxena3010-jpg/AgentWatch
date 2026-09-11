@@ -581,7 +581,12 @@ with tab_studio:
                     st.metric("Faithfulness Score", f"{f_sc * 100:.0f}%")
                 with r_c3:
                     audit_info = trace_res.get("auditor_classification") or {}
-                    st.metric("Audited Failure", audit_info.get("failure_mode") or "none")
+                    raw_fm = audit_info.get("failure_mode")
+                    fm_name = getattr(raw_fm, "value", raw_fm) or "none"
+                    st.metric("Audited Failure", fm_name)
+
+                if audit_info.get("explanation"):
+                    st.warning(f"**Auditor Explanation:** {audit_info['explanation']}")
 
                 st.markdown(f"**Agent Response:** {trace_res.get('final_response')}")
 

@@ -211,9 +211,13 @@ def create_trace(trace: AgentTrace, db: Session = Depends(get_db)):
         except Exception:
             pass
 
-    # Auto-audit if flagged
+    # Auto-audit if flagged or status != success
     threshold = load_threshold()
-    if trace.anomaly_score is not None and trace.anomaly_score >= threshold and not trace.auditor_classification:
+    should_audit = (
+        (trace.anomaly_score is not None and trace.anomaly_score >= threshold)
+        or (trace.status != "success")
+    )
+    if should_audit and not trace.auditor_classification:
         try:
             from auditor.auditor import classify_trace
             audit_res = classify_trace(trace.model_dump())

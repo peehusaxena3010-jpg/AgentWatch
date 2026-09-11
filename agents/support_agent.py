@@ -296,12 +296,16 @@ def execute_and_observe(user_input: str, auto_score: bool = True, persist: bool 
         except Exception:
             pass
 
-        # 3. Auditor if flagged
+        # 3. Auditor if flagged or if status is not success
         try:
             from ml.threshold_config import load_threshold
             from auditor.auditor import classify_trace
             threshold = load_threshold()
-            if trace.anomaly_score is not None and trace.anomaly_score >= threshold:
+            should_audit = (
+                (trace.anomaly_score is not None and trace.anomaly_score >= threshold)
+                or (trace.status != TraceStatus.success)
+            )
+            if should_audit:
                 audit_res = classify_trace(trace.model_dump())
                 trace.auditor_classification = AuditorClassification(
                     failure_mode=audit_res.get("failure_mode"),
