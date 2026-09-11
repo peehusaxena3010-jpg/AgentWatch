@@ -641,12 +641,12 @@ with tab_calibration:
             with st.spinner("Searching optimal operating point..."):
                 res = recalibrate_threshold_action()
                 if res["success"]:
+                    st.balloons()
                     st.success(
                         f"✅ Recalibration successful! New threshold: **{res['new_threshold']}** "
                         f"(FPR dropped from {res['old_fpr']*100:.0f}% to {res['new_fpr']*100:.0f}%, "
                         f"Recall: {res['new_tpr']*100:.0f}%, Youden's J = {res['youdens_j']:.3f})"
                     )
-                    st.rerun()
                 else:
                     st.error(res["message"])
 
