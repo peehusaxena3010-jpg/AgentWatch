@@ -672,16 +672,13 @@ with tab_calibration:
                 if res["success"]:
                     st.markdown(f"""
                     <div class="gleam-banner">
-                      <div style="display: flex; align-items: flex-start; gap: 12px;">
-                        <span style="font-size: 1.5rem; line-height: 1;">✨</span>
-                        <div>
-                          <b style="color: #6ee7b7; font-size: 1.05rem; letter-spacing: -0.01em;">Recalibration Successful!</b>
-                          <div style="font-size: 0.9rem; color: #d1fae5; margin-top: 4px; line-height: 1.5;">
-                            New Optimal Threshold: <code style="background: rgba(0,0,0,0.4); color: #34d399; padding: 2px 6px; border-radius: 4px;">{res['new_threshold']}</code> &nbsp;|&nbsp;
-                            False-Positive Rate dropped from <b>{res['old_fpr']*100:.0f}%</b> to <b style="color: #34d399;">{res['new_fpr']*100:.0f}%</b> &nbsp;|&nbsp;
-                            Recall: <b>{res['new_tpr']*100:.0f}%</b> &nbsp;|&nbsp;
-                            Youden's J = <b>{res['youdens_j']:.3f}</b>
-                          </div>
+                      <div>
+                        <b style="color: #6ee7b7; font-size: 1.05rem; letter-spacing: -0.01em;">Recalibration Successful!</b>
+                        <div style="font-size: 0.9rem; color: #d1fae5; margin-top: 4px; line-height: 1.5;">
+                          New Optimal Threshold: <code style="background: rgba(0,0,0,0.4); color: #34d399; padding: 2px 6px; border-radius: 4px;">{res['new_threshold']}</code> &nbsp;|&nbsp;
+                          False-Positive Rate dropped from <b>{res['old_fpr']*100:.0f}%</b> to <b style="color: #34d399;">{res['new_fpr']*100:.0f}%</b> &nbsp;|&nbsp;
+                          Recall: <b>{res['new_tpr']*100:.0f}%</b> &nbsp;|&nbsp;
+                          Youden's J = <b>{res['youdens_j']:.3f}</b>
                         </div>
                       </div>
                     </div>
