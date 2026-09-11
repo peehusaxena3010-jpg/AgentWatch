@@ -148,6 +148,35 @@ st.markdown("""
     font-size: 0.75rem;
     font-weight: 600;
   }
+
+  /* Gleaming pulse animation for recalibration */
+  @keyframes gleamPulse {
+    0% {
+      box-shadow: 0 0 0px rgba(16, 185, 129, 0);
+      border-color: rgba(16, 185, 129, 0.3);
+    }
+    40% {
+      box-shadow: 0 0 25px rgba(52, 211, 153, 0.75), inset 0 0 15px rgba(52, 211, 153, 0.25);
+      border-color: #34d399;
+      transform: scale(1.008);
+    }
+    100% {
+      box-shadow: 0 0 8px rgba(16, 185, 129, 0.25);
+      border-color: rgba(16, 185, 129, 0.45);
+      transform: scale(1.0);
+    }
+  }
+
+  .gleam-banner {
+    background: linear-gradient(135deg, rgba(6, 78, 59, 0.45) 0%, rgba(15, 23, 42, 0.85) 100%);
+    border: 1.5px solid rgba(52, 211, 153, 0.5);
+    border-radius: 10px;
+    padding: 16px 20px;
+    color: #ecfdf5;
+    animation: gleamPulse 1.2s cubic-bezier(0.16, 1, 0.3, 1);
+    margin-top: 14px;
+    margin-bottom: 14px;
+  }
 </style>
 """, unsafe_allow_html=True)
 
@@ -641,11 +670,22 @@ with tab_calibration:
             with st.spinner("Searching optimal operating point..."):
                 res = recalibrate_threshold_action()
                 if res["success"]:
-                    st.success(
-                        f"✅ Recalibration successful! New threshold: **{res['new_threshold']}** "
-                        f"(FPR dropped from {res['old_fpr']*100:.0f}% to {res['new_fpr']*100:.0f}%, "
-                        f"Recall: {res['new_tpr']*100:.0f}%, Youden's J = {res['youdens_j']:.3f})"
-                    )
+                    st.markdown(f"""
+                    <div class="gleam-banner">
+                      <div style="display: flex; align-items: flex-start; gap: 12px;">
+                        <span style="font-size: 1.5rem; line-height: 1;">✨</span>
+                        <div>
+                          <b style="color: #6ee7b7; font-size: 1.05rem; letter-spacing: -0.01em;">Recalibration Successful!</b>
+                          <div style="font-size: 0.9rem; color: #d1fae5; margin-top: 4px; line-height: 1.5;">
+                            New Optimal Threshold: <code style="background: rgba(0,0,0,0.4); color: #34d399; padding: 2px 6px; border-radius: 4px;">{res['new_threshold']}</code> &nbsp;|&nbsp;
+                            False-Positive Rate dropped from <b>{res['old_fpr']*100:.0f}%</b> to <b style="color: #34d399;">{res['new_fpr']*100:.0f}%</b> &nbsp;|&nbsp;
+                            Recall: <b>{res['new_tpr']*100:.0f}%</b> &nbsp;|&nbsp;
+                            Youden's J = <b>{res['youdens_j']:.3f}</b>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                    """, unsafe_allow_html=True)
                 else:
                     st.error(res["message"])
 
